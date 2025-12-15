@@ -7,21 +7,40 @@ export default async function handler(req, res) {
             id
             title
             handle
+            variants(first: 10) {
+              edges {
+                node {
+                  id
+                  title
+                  price {
+                    amount
+                    currencyCode
+                  }
+                }
+              }
+            }
           }
         }
       }
     }
   `;
 
-  const r = await fetch(`${req.headers["x-forwarded-proto"] || "https"}://${req.headers.host}/api/shopify-graphql`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ query, variables: { first: 50 } })
-  });
+  const r = await fetch(
+    `${req.headers["x-forwarded-proto"] || "https"}://${req.headers.host}/api/shopify-graphql`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ query, variables: { first: 50 } })
+    }
+  );
 
   const json = await r.json();
   if (!r.ok) return res.status(r.status).json(json);
 
-  const products = (json?.data?.products?.edges || []).map(e => e.node);
+  const products = (json?.data?.products?.edges || []).map(e => ({
+    ...e.node,
+    variants: e.node.variants.edges.map(v => v.node)
+  }));
+
   res.status(200).json({ ok: true, products });
 }
