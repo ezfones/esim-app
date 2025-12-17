@@ -75,7 +75,7 @@ async function esimgoCreateOrder({ sku, quantity }) {
   // POST /orders with type=transaction, assign=true, item=bundle name (your SKU)
   // Returns orderReference. :contentReference[oaicite:3]{index=3}
   const payload = {
-    type: "transaction",
+    type: "validate",
     assign: true,
     order: [
       {
