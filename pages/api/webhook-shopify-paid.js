@@ -1,178 +1,225 @@
 import crypto from "crypto";
 
-export const config = { api: { bodyParser: false } };
+const SHOP_DOMAIN = process.env.SHOPIFY_STORE_DOMAIN;
+const ADMIN_TOKEN = process.env.SHOPIFY_ADMIN_ACCESS_TOKEN;
+const WEBHOOK_SECRET = process.env.SHOPIFY_WEBHOOK_SECRET;
 
-function verifyShopifyHmac(rawBody, hmacHeader, secret) {
-  if (!hmacHeader || !secret) return false;
+const ESIMGO_API_KEY = process.env.ESIMGO_API_KEY;
+const ESIMGO_BASE_URL = process.env.ESIMGO_BASE_URL || "https://api.esim-go.com/v2.4";
+const PROVISION_ENABLED = (process.env.ESIM_PROVISION_ENABLED || "false").toLowerCase() === "true";
 
-  const digest = crypto
-    .createHmac("sha256", secret)
-    .update(rawBody, "utf8")
-    .digest("base64");
-
-  const a = Buffer.from(digest);
-  const b = Buffer.from(hmacHeader);
-  if (a.length !== b.length) return false;
-
-  return crypto.timingSafeEqual(a, b);
-}
+export const config = {
+  api: { bodyParser: false }, // IMPORTANT for Shopify HMAC verification
+};
 
 async function readRawBody(req) {
   const chunks = [];
   for await (const chunk of req) chunks.push(chunk);
-  return Buffer.concat(chunks).toString("utf8");
+  return Buffer.concat(chunks);
 }
 
-async function adminGraphql(shopDomain, adminToken, query, variables) {
-  const url = `https://${shopDomain}/admin/api/2024-07/graphql.json`;
+function verifyShopifyHmac(rawBody, hmacHeader) {
+  if (!WEBHOOK_SECRET) throw new Error("Missing SHOPIFY_WEBHOOK_SECRET");
+  const digest = crypto
+    .createHmac("sha256", WEBHOOK_SECRET)
+    .update(rawBody)
+    .digest("base64");
+  return crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(hmacHeader || ""));
+}
 
-  const r = await fetch(url, {
+async function shopifyAdminGraphql(query, variables) {
+  if (!SHOP_DOMAIN || !ADMIN_TOKEN) throw new Error("Missing SHOPIFY_STORE_DOMAIN or SHOPIFY_ADMIN_ACCESS_TOKEN");
+
+  const r = await fetch(`https://${SHOP_DOMAIN}/admin/api/2024-07/graphql.json`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "X-Shopify-Access-Token": adminToken,
+      "X-Shopify-Access-Token": ADMIN_TOKEN,
     },
     body: JSON.stringify({ query, variables }),
   });
 
   const json = await r.json();
-  if (!r.ok) throw new Error(`Admin GraphQL HTTP ${r.status}: ${JSON.stringify(json)}`);
-  if (json.errors?.length) throw new Error(`Admin GraphQL errors: ${JSON.stringify(json.errors)}`);
-
-  return json;
+  if (json.errors?.length) {
+    throw new Error(`Shopify GraphQL errors: ${JSON.stringify(json.errors)}`);
+  }
+  return json.data;
 }
 
-async function getOrderMetafield(shopDomain, adminToken, orderGid, namespace, key) {
-  const q = `
-    query ($id: ID!) {
-      order(id: $id) {
-        metafield(namespace: "${namespace}", key: "${key}") { id value }
-      }
-    }
-  `;
-  const json = await adminGraphql(shopDomain, adminToken, q, { id: orderGid });
-  return json?.data?.order?.metafield || null;
-}
-
-async function setOrderMetafields(shopDomain, adminToken, orderGid, metafields) {
-  const m = `
-    mutation MetafieldsSet($metafields: [MetafieldsSetInput!]!) {
+async function setOrderMetafields(orderGid, pairs) {
+  // pairs: [{namespace:"esim", key:"status", type:"single_line_text_field", value:"pending"}, ...]
+  const mutation = `
+    mutation($metafields: [MetafieldsSetInput!]!) {
       metafieldsSet(metafields: $metafields) {
-        metafields { id namespace key value type }
+        metafields { id namespace key type value }
         userErrors { field message }
       }
     }
   `;
 
-  const variables = {
-    metafields: metafields.map((f) => ({
-      ownerId: orderGid,
-      namespace: f.namespace,
-      key: f.key,
-      type: f.type,
-      value: f.value,
-    })),
-  };
+  const metafields = pairs.map(p => ({
+    ownerId: orderGid,
+    namespace: p.namespace,
+    key: p.key,
+    type: p.type,
+    value: p.value,
+  }));
 
-  const json = await adminGraphql(shopDomain, adminToken, m, variables);
-  const errs = json?.data?.metafieldsSet?.userErrors || [];
+  const data = await shopifyAdminGraphql(mutation, { metafields });
+  const errs = data.metafieldsSet?.userErrors || [];
   if (errs.length) throw new Error(`metafieldsSet userErrors: ${JSON.stringify(errs)}`);
-  return json?.data?.metafieldsSet?.metafields || [];
+  return data.metafieldsSet?.metafields || [];
 }
 
-// Placeholder: we’ll replace this with real eSIMGo call next
-async function provisionEsimStub({ items }) {
-  return {
-    provider: "stub",
-    provisionedAt: new Date().toISOString(),
-    items,
-    esim: {
-      iccid: "0000000000000000000",
-      smdpPlus: "smdp.example.com",
-      activationCode: "ACTIVATION-CODE-STUB",
-      qrText: "LPA:1$smdp.example.com$ACTIVATION-CODE-STUB",
+async function esimgoCreateOrder({ sku, quantity }) {
+  // POST /orders with type=transaction, assign=true, item=bundle name (your SKU)
+  // Returns orderReference. :contentReference[oaicite:3]{index=3}
+  const payload = {
+    type: "transaction",
+    assign: true,
+    order: [
+      {
+        type: "bundle",
+        quantity,
+        item: sku,
+        // IMPORTANT: if assign=true and you want a NEW eSIM, do not supply iccids. :contentReference[oaicite:4]{index=4}
+      },
+    ],
+  };
+
+  const r = await fetch(`${ESIMGO_BASE_URL}/orders`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-API-Key": ESIMGO_API_KEY, // eSIM Go auth :contentReference[oaicite:5]{index=5}
     },
+    body: JSON.stringify(payload),
+  });
+
+  const json = await r.json();
+  if (!r.ok) throw new Error(`eSIMGo /orders failed ${r.status}: ${JSON.stringify(json)}`);
+
+  // Docs say you use orderReference to download install/QR details. :contentReference[oaicite:6]{index=6}
+  const orderReference = json?.orderReference || json?.order_reference || json?.reference;
+  if (!orderReference) throw new Error(`No orderReference in eSIMGo response: ${JSON.stringify(json)}`);
+
+  return { orderReference, raw: json };
+}
+
+async function esimgoGetInstallDetails(orderReference) {
+  // GET /esims/assignments?reference=... with Accept: application/json
+  // Returns ICCID + smdpAddress + matchingId (+ appleInstallUrl if requested). :contentReference[oaicite:7]{index=7}
+  const url = new URL(`${ESIMGO_BASE_URL}/esims/assignments`);
+  url.searchParams.set("reference", orderReference);
+  url.searchParams.set("additionalFields", "appleInstallUrl");
+
+  const r = await fetch(url.toString(), {
+    method: "GET",
+    headers: {
+      "X-API-Key": ESIMGO_API_KEY,
+      "Accept": "application/json",
+    },
+  });
+
+  const json = await r.json();
+  if (!r.ok) throw new Error(`eSIMGo /esims/assignments failed ${r.status}: ${JSON.stringify(json)}`);
+
+  // Some accounts return an array; some return an object. Handle both.
+  const first = Array.isArray(json) ? json[0] : json;
+  if (!first?.iccid) throw new Error(`No ICCID in install details: ${JSON.stringify(json)}`);
+
+  return {
+    iccid: first.iccid,
+    smdpAddress: first.smdpAddress,
+    matchingId: first.matchingId,
+    appleInstallUrl: first.appleInstallUrl || "",
+    raw: json,
   };
 }
 
 export default async function handler(req, res) {
-  if (req.method !== "POST") {
-    res.setHeader("Allow", "POST");
-    return res.status(405).send("Method not allowed");
-  }
-
-  const secret = process.env.SHOPIFY_WEBHOOK_SECRET;
-  const adminToken = process.env.SHOPIFY_ADMIN_ACCESS_TOKEN;
-
-  if (!secret) return res.status(500).send("Missing SHOPIFY_WEBHOOK_SECRET");
-  if (!adminToken) return res.status(500).send("Missing SHOPIFY_ADMIN_ACCESS_TOKEN");
-
-  const rawBody = await readRawBody(req);
-
-  const hmac = req.headers["x-shopify-hmac-sha256"];
-  const topic = req.headers["x-shopify-topic"];
-  const shop = req.headers["x-shopify-shop-domain"];
-
-  if (!verifyShopifyHmac(rawBody, hmac, secret)) {
-    console.log("❌ Invalid Shopify HMAC", { topic, shop });
-    return res.status(401).send("Invalid HMAC");
-  }
-
-  const order = JSON.parse(rawBody);
-  const orderId = order?.id; // numeric
-  if (!orderId) return res.status(200).json({ ok: true, skipped: "no-order-id" });
-
-  const orderGid = `gid://shopify/Order/${orderId}`;
-
-  const items = (order?.line_items || []).map((li) => ({
-    title: li.title,
-    sku: li.sku,
-    quantity: li.quantity,
-  }));
-
-  console.log("✅ Shopify webhook verified", { topic, shop, orderId, itemsCount: items.length });
-
-  // ---- Idempotency: don’t provision twice ----
-  const statusMf = await getOrderMetafield(shop, adminToken, orderGid, "esim", "status");
-  if (statusMf?.value === "provisioned") {
-    console.log("↩️ Already provisioned, skipping", { orderId });
-    return res.status(200).json({ ok: true, skipped: "already-provisioned" });
-  }
-
-  // ---- Always write “pending” + items + backend marker ----
-  await setOrderMetafields(shop, adminToken, orderGid, [
-    { namespace: "esim", key: "backend", type: "single_line_text_field", value: "vercel" },
-    { namespace: "esim", key: "status", type: "single_line_text_field", value: "pending" },
-    { namespace: "esim", key: "items", type: "json", value: JSON.stringify(items) },
-    { namespace: "esim", key: "provider", type: "single_line_text_field", value: process.env.ESIM_PROVIDER || "esimgo" },
-  ]);
-
-  const provisionEnabled = String(process.env.ESIM_PROVISION_ENABLED || "false").toLowerCase() === "true";
-
-  if (!provisionEnabled) {
-    console.log("🟡 Provisioning disabled (ESIM_PROVISION_ENABLED=false). Metafields set to pending.");
-    return res.status(200).json({ ok: true, status: "pending", provisioned: false });
-  }
-
-  // ---- Provision (stub for now; next step we swap to real eSIMGo) ----
   try {
-    const result = await provisionEsimStub({ items });
+    const rawBody = await readRawBody(req);
+    const hmac = req.headers["x-shopify-hmac-sha256"];
+    const topic = req.headers["x-shopify-topic"];
 
-    await setOrderMetafields(shop, adminToken, orderGid, [
+    if (!verifyShopifyHmac(rawBody, hmac)) {
+      return res.status(401).json({ ok: false, error: "Invalid webhook signature" });
+    }
+
+    if (topic !== "orders/paid") {
+      return res.status(200).json({ ok: true, ignored: `topic=${topic}` });
+    }
+
+    const order = JSON.parse(rawBody.toString("utf8"));
+
+    // Shopify numeric id (REST) -> convert to GID
+    const orderGid = `gid://shopify/Order/${order.id}`;
+
+    const email = order.email || order.customer?.email || "";
+    const orderName = order.name || "";
+
+    const lineItems = order.line_items || [];
+    const items = lineItems
+      .map(li => ({
+        title: li.title,
+        sku: li.sku,
+        quantity: li.quantity || 1,
+      }))
+      .filter(x => x.sku);
+
+    if (!items.length) {
+      await setOrderMetafields(orderGid, [
+        { namespace: "esim", key: "status", type: "single_line_text_field", value: "no_sku" },
+        { namespace: "esim", key: "provider", type: "single_line_text_field", value: "esimgo" },
+      ]);
+      return res.status(200).json({ ok: true, message: "No SKUs found; marked no_sku" });
+    }
+
+    // Write initial metafields
+    await setOrderMetafields(orderGid, [
+      { namespace: "esim", key: "status", type: "single_line_text_field", value: "pending" },
+      { namespace: "esim", key: "provider", type: "single_line_text_field", value: "esimgo" },
+      { namespace: "esim", key: "backend", type: "single_line_text_field", value: "vercel" },
+      { namespace: "esim", key: "items", type: "json", value: JSON.stringify(items) },
+    ]);
+
+    // Safety switch
+    if (!PROVISION_ENABLED) {
+      return res.status(200).json({
+        ok: true,
+        message: "Provisioning disabled (ESIM_PROVISION_ENABLED=false). Metafields set to pending.",
+      });
+    }
+
+    // For now: provision ONLY the first SKU (single item checkout). Expand later.
+    const first = items[0];
+
+    if (!ESIMGO_API_KEY) throw new Error("Missing ESIMGO_API_KEY");
+
+    // 1) Create eSIMGo order -> orderReference :contentReference[oaicite:8]{index=8}
+    const created = await esimgoCreateOrder({ sku: first.sku, quantity: first.quantity });
+
+    // 2) Fetch install details + Apple install URL :contentReference[oaicite:9]{index=9}
+    const install = await esimgoGetInstallDetails(created.orderReference);
+
+    // 3) Write metafields
+    await setOrderMetafields(orderGid, [
+      { namespace: "esim", key: "orderReference", type: "single_line_text_field", value: created.orderReference },
+      { namespace: "esim", key: "iccid", type: "single_line_text_field", value: install.iccid },
+      { namespace: "esim", key: "smdpAddress", type: "single_line_text_field", value: install.smdpAddress || "" },
+      { namespace: "esim", key: "matchingId", type: "single_line_text_field", value: install.matchingId || "" },
+      { namespace: "esim", key: "appleInstallUrl", type: "url", value: install.appleInstallUrl || "" },
       { namespace: "esim", key: "status", type: "single_line_text_field", value: "provisioned" },
-      { namespace: "esim", key: "result", type: "json", value: JSON.stringify(result) },
-      { namespace: "esim", key: "error", type: "single_line_text_field", value: "" },
     ]);
 
-    console.log("✅ Provisioned (stub) + metafields updated", { orderId });
-    return res.status(200).json({ ok: true, status: "provisioned", provisioned: true });
+    return res.status(200).json({
+      ok: true,
+      order: { name: orderName, email },
+      provisioned: { sku: first.sku, orderReference: created.orderReference, iccid: install.iccid },
+    });
   } catch (e) {
-    await setOrderMetafields(shop, adminToken, orderGid, [
-      { namespace: "esim", key: "status", type: "single_line_text_field", value: "failed" },
-      { namespace: "esim", key: "error", type: "single_line_text_field", value: String(e) },
-    ]);
-
-    console.log("❌ Provision failed", String(e));
-    return res.status(200).json({ ok: true, status: "failed" });
+    console.error(e);
+    return res.status(500).json({ ok: false, error: e.message || String(e) });
   }
 }
