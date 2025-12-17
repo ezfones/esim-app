@@ -5,7 +5,10 @@ export default async function handler(req, res) {
 
   if (!orderId) return res.status(400).json({ ok: false, error: "Missing orderId" });
   if (!shopDomain || !adminToken) {
-    return res.status(500).json({ ok: false, error: "Missing SHOPIFY_STORE_DOMAIN or SHOPIFY_ADMIN_ACCESS_TOKEN" });
+    return res.status(500).json({
+      ok: false,
+      error: "Missing SHOPIFY_STORE_DOMAIN or SHOPIFY_ADMIN_ACCESS_TOKEN"
+    });
   }
 
   const orderGid = `gid://shopify/Order/${orderId}`;
@@ -15,7 +18,7 @@ export default async function handler(req, res) {
       order(id: $id) {
         id
         name
-        metafields(first: 20, namespace: "esim") {
+        metafields(first: 50) {
           edges {
             node {
               id
@@ -40,12 +43,30 @@ export default async function handler(req, res) {
   });
 
   const json = await r.json();
-  if (!r.ok) return res.status(r.status).json({ ok: false, shopify: json });
 
-  const mfs = json?.data?.order?.metafields?.edges?.map(e => e.node) || [];
+  // If Shopify returns errors, surface them clearly
+  if (json?.errors?.length) {
+    return res.status(200).json({ ok: false, shopDomain, orderGid, shopifyErrors: json.errors });
+  }
+
+  const order = json?.data?.order;
+  if (!order) {
+    return res.status(200).json({
+      ok: false,
+      shopDomain,
+      orderGid,
+      error: "Order not found via Admin API (check domain/token/orderId)"
+    });
+  }
+
+  const all = (order.metafields?.edges || []).map(e => e.node);
+  const esim = all.filter(m => m.namespace === "esim");
+
   return res.status(200).json({
     ok: true,
-    order: { id: json?.data?.order?.id, name: json?.data?.order?.name },
-    metafields: mfs
+    shopDomain,
+    order: { id: order.id, name: order.name },
+    metafields_all_count: all.length,
+    metafields_esim: esim
   });
 }
