@@ -36,12 +36,8 @@ async function shopifyAdminGraphql(shopDomain, adminToken, query, variables) {
   });
 
   const json = await r.json();
-  if (!r.ok) {
-    throw new Error(`Shopify Admin API HTTP ${r.status}: ${JSON.stringify(json)}`);
-  }
-  if (json.errors?.length) {
-    throw new Error(`Shopify GraphQL errors: ${JSON.stringify(json.errors)}`);
-  }
+  if (!r.ok) throw new Error(`Shopify Admin API HTTP ${r.status}: ${JSON.stringify(json)}`);
+  if (json.errors?.length) throw new Error(`Shopify GraphQL errors: ${JSON.stringify(json.errors)}`);
   return json.data;
 }
 
@@ -55,7 +51,7 @@ async function setOrderMetafields(shopDomain, adminToken, orderGid, pairs) {
     }
   `;
 
-  // Filter out blank values so we never hit "Value can't be blank."
+  // Filter out blank values to avoid Shopify "Value can't be blank"
   const filtered = (pairs || []).filter((p) => {
     if (!p) return false;
     if (p.value === undefined || p.value === null) return false;
@@ -89,13 +85,7 @@ async function esimgoCreateOrder({ baseUrl, apiKey, sku, quantity, orderType }) 
   const payload = {
     type: orderType, // "validate" | "transaction"
     assign: true,
-    order: [
-      {
-        type: "bundle",
-        quantity,
-        item: sku,
-      },
-    ],
+    order: [{ type: "bundle", quantity, item: sku }],
   };
 
   const r = await fetch(url, {
@@ -109,12 +99,8 @@ async function esimgoCreateOrder({ baseUrl, apiKey, sku, quantity, orderType }) 
   });
 
   const json = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(`eSIMGo /orders failed ${r.status}: ${JSON.stringify(json)}`);
 
-  if (!r.ok) {
-    throw new Error(`eSIMGo /orders failed ${r.status}: ${JSON.stringify(json)}`);
-  }
-
-  // validate mode may not return orderReference
   const orderReference =
     json?.orderReference ||
     json?.order_reference ||
@@ -136,17 +122,11 @@ async function esimgoGetAssignments({ baseUrl, apiKey, orderReference }) {
 
   const r = await fetch(u.toString(), {
     method: "GET",
-    headers: {
-      "X-API-Key": apiKey,
-      Accept: "application/json",
-    },
+    headers: { "X-API-Key": apiKey, Accept: "application/json" },
   });
 
   const json = await r.json().catch(() => ({}));
-
-  if (!r.ok) {
-    throw new Error(`eSIMGo /esims/assignments failed ${r.status}: ${JSON.stringify(json)}`);
-  }
+  if (!r.ok) throw new Error(`eSIMGo /esims/assignments failed ${r.status}: ${JSON.stringify(json)}`);
 
   const first = Array.isArray(json) ? json[0] : json;
   if (!first) throw new Error(`eSIMGo assignments empty: ${JSON.stringify(json)}`);
@@ -165,10 +145,9 @@ export default async function handler(req, res) {
   const webhookSecret = process.env.SHOPIFY_WEBHOOK_SECRET;
 
   const provisionEnabled = String(process.env.ESIM_PROVISION_ENABLED || "false").toLowerCase() === "true";
-
   const esimgoBaseUrl = process.env.ESIMGO_BASE_URL || "https://api.esim-go.com/v2.4";
   const esimgoApiKey = process.env.ESIMGO_API_KEY || "";
-  const orderType = (process.env.ESIMGO_ORDER_TYPE || "validate").toLowerCase(); // validate | transaction
+  const orderType = (process.env.ESIMGO_ORDER_TYPE || "validate").toLowerCase();
 
   let orderGid = null;
 
@@ -224,19 +203,13 @@ export default async function handler(req, res) {
     }
 
     if (!provisionEnabled) {
-      return res.status(200).json({
-        ok: true,
-        status: "pending",
-        message: "Provisioning disabled (ESIM_PROVISION_ENABLED=false)",
-      });
+      return res.status(200).json({ ok: true, status: "pending", message: "Provisioning disabled" });
     }
 
     if (!esimgoApiKey) throw new Error("Missing ESIMGO_API_KEY");
 
-    // For now, provision the first SKU only
     const first = items[0];
 
-    // 1) Validate or Transaction
     const created = await esimgoCreateOrder({
       baseUrl: esimgoBaseUrl,
       apiKey: esimgoApiKey,
@@ -245,7 +218,7 @@ export default async function handler(req, res) {
       orderType,
     });
 
-    // Validate mode: mark validated and stop (no credits consumed)
+    // Validate mode: no credits, no email, just mark validated
     if (orderType === "validate") {
       await setOrderMetafields(shopDomain, adminToken, orderGid, [
         { namespace: "esim", key: "status", type: "single_line_text_field", value: "validated" },
@@ -253,7 +226,6 @@ export default async function handler(req, res) {
       return res.status(200).json({ ok: true, status: "validated", sku: first.sku });
     }
 
-    // Transaction mode: save orderReference, fetch assignment, write details
     await setOrderMetafields(shopDomain, adminToken, orderGid, [
       { namespace: "esim", key: "orderReference", type: "single_line_text_field", value: created.orderReference },
     ]);
@@ -266,23 +238,40 @@ export default async function handler(req, res) {
 
     await setOrderMetafields(shopDomain, adminToken, orderGid, [
       { namespace: "esim", key: "iccid", type: "single_line_text_field", value: a.iccid },
+      // Only written if non-blank (filtered)
       { namespace: "esim", key: "smdpAddress", type: "single_line_text_field", value: a.smdpAddress },
       { namespace: "esim", key: "activationCode", type: "single_line_text_field", value: a.activationCode },
-      { namespace: "esim", key: "iosUniversalLink", type: "single_line_text_field", value: a.appleInstallUrl || "" },
+      { namespace: "esim", key: "iosUniversalLink", type: "single_line_text_field", value: a.appleInstallUrl },
       { namespace: "esim", key: "status", type: "single_line_text_field", value: "provisioned" },
     ]);
 
-    // ✅ Send email AFTER provisioned (only in transaction mode)
+    // ✅ FIX A: Email failures do NOT fail the whole webhook
     if (customerEmail) {
-      await sendEsimEmail({
-        to: customerEmail,
-        orderNumber: orderNumber || created.orderReference,
-        destination: first.title || "Your destination",
-        planName: first.sku,
-        iosUniversalLink: a.appleInstallUrl,
-        smdpAddress: a.smdpAddress,
-        activationCode: a.activationCode,
-      });
+      try {
+        await sendEsimEmail({
+          to: customerEmail,
+          orderNumber: orderNumber || created.orderReference,
+          destination: first.title || "Your destination",
+          planName: first.sku,
+          iosUniversalLink: a.appleInstallUrl,
+          smdpAddress: a.smdpAddress,
+          activationCode: a.activationCode,
+        });
+
+        await setOrderMetafields(shopDomain, adminToken, orderGid, [
+          { namespace: "esim", key: "emailStatus", type: "single_line_text_field", value: "sent" },
+        ]);
+      } catch (err) {
+        await setOrderMetafields(shopDomain, adminToken, orderGid, [
+          { namespace: "esim", key: "emailStatus", type: "single_line_text_field", value: "failed" },
+          {
+            namespace: "esim",
+            key: "emailError",
+            type: "single_line_text_field",
+            value: (err?.message || String(err)).slice(0, 200),
+          },
+        ]);
+      }
     }
 
     return res.status(200).json({
