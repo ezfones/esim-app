@@ -32,7 +32,7 @@ function getShopifyDomain() {
 
 function getShopifyAdminToken() {
   return (
-    process.env.SHOPIFY_ADMIN_ACCESS_TOKEN || // ✅ your current var
+    process.env.SHOPIFY_ADMIN_ACCESS_TOKEN || // your current var
     process.env.SHOPIFY_ADMIN_TOKEN ||
     process.env.SHOPIFY_ACCESS_TOKEN ||
     process.env.SHOPIFY_ADMIN_API_TOKEN ||
@@ -98,17 +98,46 @@ async function getOrder(orderGid) {
 }
 
 /**
- * Placeholder until wired to eSIM Go for real.
- * Replace this function when ready.
+ * eSIM Go provisioning (replace endpoint/fields to match your account if needed)
  */
 async function getEsimDetailsForOrder(order) {
+  if (!process.env.ESIMGO_API_KEY) {
+    throw new Error("Missing ESIMGO_API_KEY");
+  }
+
   const firstItem = order?.lineItems?.edges?.[0]?.node;
+  if (!firstItem?.sku) {
+    throw new Error("Missing SKU for eSIM lookup");
+  }
+
+  // Provision eSIM with provider
+  const resp = await fetch("https://api.esimgo.com/v1/esims/provision", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${process.env.ESIMGO_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      reference: order.name,
+      sku: firstItem.sku,
+      quantity: firstItem.quantity || 1,
+    }),
+  });
+
+  const json = await resp.json();
+
+  if (!resp.ok) {
+    throw new Error(`eSIM Go error: ${JSON.stringify(json)}`);
+  }
+
+  const esim = json.esims?.[0];
+  if (!esim) throw new Error("No eSIM returned from provider");
 
   return {
-    productTitle: firstItem?.title || "eSIM",
-    iccid: "8988XXXXXXXXXXXXXXX",
-    qrCodeUrl: "https://example.com/qr-code.png",
-    iosInstallUrl: "https://example.com/ios-install-link",
+    productTitle: firstItem.title,
+    iccid: esim.iccid,
+    qrCodeUrl: esim.qr_code_url,
+    iosInstallUrl: esim.ios_install_url,
   };
 }
 
