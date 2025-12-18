@@ -54,13 +54,24 @@ async function setOrderMetafields(shopDomain, adminToken, orderGid, pairs) {
     }
   `;
 
-  const metafields = pairs.map((p) => ({
+  // Filter out any blank values so we never hit "Value can't be blank."
+  const filtered = (pairs || []).filter((p) => {
+    if (!p) return false;
+    if (p.value === undefined || p.value === null) return false;
+    if (typeof p.value === "string" && p.value.trim() === "") return false;
+    return true;
+  });
+
+  const metafields = filtered.map((p) => ({
     ownerId: orderGid,
     namespace: p.namespace,
     key: p.key,
     type: p.type,
     value: p.value,
   }));
+
+  // If nothing to write, just return.
+  if (!metafields.length) return [];
 
   const data = await shopifyAdminGraphql(shopDomain, adminToken, mutation, { metafields });
   const errs = data.metafieldsSet?.userErrors || [];
@@ -76,7 +87,7 @@ async function esimgoCreateOrder({ baseUrl, apiKey, sku, quantity, orderType }) 
   const url = `${cleanBaseUrl(baseUrl)}/orders`;
 
   const payload = {
-    type: orderType, // validate | transaction
+    type: orderType, // "validate" | "transaction"
     assign: true,
     order: [
       {
@@ -103,7 +114,7 @@ async function esimgoCreateOrder({ baseUrl, apiKey, sku, quantity, orderType }) 
     throw new Error(`eSIMGo /orders failed ${r.status}: ${JSON.stringify(json)}`);
   }
 
-  // validate mode often does NOT return orderReference (that's OK)
+  // validate mode may not return orderReference
   const orderReference =
     json?.orderReference ||
     json?.order_reference ||
@@ -149,11 +160,12 @@ async function esimgoGetAssignments({ baseUrl, apiKey, orderReference }) {
 }
 
 export default async function handler(req, res) {
-  const shopDomain = process.env.SHOPIFY_STORE_DOMAIN;
-  const adminToken = process.env.SHOPIFY_ADMIN_ACCESS_TOKEN;
+  const shopDomain = process.env.SHOPIFY_STORE_DOMAIN; // qrrmee-m0.myshopify.com
+  const adminToken = process.env.SHOPIFY_ADMIN_ACCESS_TOKEN; // shpat_...
   const webhookSecret = process.env.SHOPIFY_WEBHOOK_SECRET;
 
   const provisionEnabled = String(process.env.ESIM_PROVISION_ENABLED || "false").toLowerCase() === "true";
+
   const esimgoBaseUrl = process.env.ESIMGO_BASE_URL || "https://api.esim-go.com/v2.4";
   const esimgoApiKey = process.env.ESIMGO_API_KEY || "";
   const orderType = (process.env.ESIMGO_ORDER_TYPE || "validate").toLowerCase(); // validate | transaction
@@ -192,19 +204,13 @@ export default async function handler(req, res) {
       }))
       .filter((x) => x.sku);
 
-    // ✅ IMPORTANT: Use ONLY single_line_text_field for everything (prevents Shopify type mismatch)
+    // ✅ Write only the fields that must exist now.
+    // IMPORTANT: 'items' MUST be json because your Shopify definition is json.
     await setOrderMetafields(shopDomain, adminToken, orderGid, [
       { namespace: "esim", key: "status", type: "single_line_text_field", value: "pending" },
       { namespace: "esim", key: "provider", type: "single_line_text_field", value: "esimgo" },
       { namespace: "esim", key: "backend", type: "single_line_text_field", value: "vercel" },
-      { namespace: "esim", key: "items", type: "single_line_text_field", value: JSON.stringify(items) },
-      { namespace: "esim", key: "error", type: "single_line_text_field", value: "" },
-      { namespace: "esim", key: "orderReference", type: "single_line_text_field", value: "" },
-      { namespace: "esim", key: "iccid", type: "single_line_text_field", value: "" },
-      { namespace: "esim", key: "smdpAddress", type: "single_line_text_field", value: "" },
-      { namespace: "esim", key: "activationCode", type: "single_line_text_field", value: "" },
-      { namespace: "esim", key: "iosUniversalLink", type: "single_line_text_field", value: "" },
-      { namespace: "esim", key: "qrPngUrl", type: "single_line_text_field", value: "" },
+      { namespace: "esim", key: "items", type: "json", value: JSON.stringify(items) },
     ]);
 
     if (!items.length) {
@@ -215,6 +221,7 @@ export default async function handler(req, res) {
       return res.status(200).json({ ok: true, status: "no_sku" });
     }
 
+    // Safety switch: stops all eSIMGo calls
     if (!provisionEnabled) {
       return res.status(200).json({
         ok: true,
@@ -225,6 +232,7 @@ export default async function handler(req, res) {
 
     if (!esimgoApiKey) throw new Error("Missing ESIMGO_API_KEY");
 
+    // For now, handle the first SKU only (we can expand later)
     const first = items[0];
 
     // 1) Validate or Transaction order with eSIMGo
@@ -236,6 +244,7 @@ export default async function handler(req, res) {
       orderType,
     });
 
+    // ✅ Validate mode: mark validated and STOP (no credits consumed)
     if (orderType === "validate") {
       await setOrderMetafields(shopDomain, adminToken, orderGid, [
         { namespace: "esim", key: "status", type: "single_line_text_field", value: "validated" },
@@ -243,7 +252,7 @@ export default async function handler(req, res) {
       return res.status(200).json({ ok: true, status: "validated", sku: first.sku });
     }
 
-    // 2) Real provisioning: store orderReference then fetch assignment details
+    // 2) Transaction mode: save orderReference then fetch assignment details
     await setOrderMetafields(shopDomain, adminToken, orderGid, [
       { namespace: "esim", key: "orderReference", type: "single_line_text_field", value: created.orderReference },
     ]);
@@ -254,11 +263,12 @@ export default async function handler(req, res) {
       orderReference: created.orderReference,
     });
 
+    // Write only values we actually have (no blanks).
     await setOrderMetafields(shopDomain, adminToken, orderGid, [
-      { namespace: "esim", key: "iccid", type: "single_line_text_field", value: a.iccid || "" },
-      { namespace: "esim", key: "smdpAddress", type: "single_line_text_field", value: a.smdpAddress || "" },
-      { namespace: "esim", key: "activationCode", type: "single_line_text_field", value: a.activationCode || "" },
-      // If eSIMGo returns appleInstallUrl we store it in iosUniversalLink
+      { namespace: "esim", key: "iccid", type: "single_line_text_field", value: a.iccid },
+      { namespace: "esim", key: "smdpAddress", type: "single_line_text_field", value: a.smdpAddress },
+      { namespace: "esim", key: "activationCode", type: "single_line_text_field", value: a.activationCode },
+      // Store Apple install url in iosUniversalLink if provided; otherwise we simply won't write it.
       { namespace: "esim", key: "iosUniversalLink", type: "single_line_text_field", value: a.appleInstallUrl || "" },
       { namespace: "esim", key: "status", type: "single_line_text_field", value: "provisioned" },
     ]);
@@ -271,15 +281,15 @@ export default async function handler(req, res) {
       iccid: a.iccid,
     });
   } catch (e) {
-    const msg = e?.message || String(e);
+    const msg = (e?.message || String(e)).slice(0, 250) || "unknown error";
     console.error("❌ webhook error:", msg);
 
-    // If we already know the orderGid, write failure into Shopify so you can see it in the order
-    if (orderGid) {
+    // Best-effort write failure into Shopify so you can see it on the order
+    if (orderGid && shopDomain && adminToken) {
       try {
         await setOrderMetafields(shopDomain, adminToken, orderGid, [
           { namespace: "esim", key: "status", type: "single_line_text_field", value: "failed" },
-          { namespace: "esim", key: "error", type: "single_line_text_field", value: msg.slice(0, 250) },
+          { namespace: "esim", key: "error", type: "single_line_text_field", value: msg },
         ]);
       } catch (err2) {
         console.error("❌ failed writing failure metafields:", err2?.message || String(err2));
