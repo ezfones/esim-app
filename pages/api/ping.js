@@ -1,3 +1,6 @@
 export default function handler(req, res) {
-  res.status(200).json({ ok: true, message: "ping ok", ts: new Date().toISOString() });
+  res.status(200).json({
+    ok: true,
+    timestamp: new Date().toISOString(),
+  });
 }
