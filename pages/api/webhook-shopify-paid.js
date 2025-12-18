@@ -2,7 +2,7 @@ import crypto from "crypto";
 import { sendEsimEmail } from "../../lib/send-esim-email";
 
 export const config = {
-  api: { bodyParser: false }, // REQUIRED for Shopify HMAC verification
+  api: { bodyParser: false }, // required for Shopify HMAC verification
 };
 
 async function getRawBody(req) {
@@ -14,22 +14,45 @@ async function getRawBody(req) {
 function verifyShopifyWebhook(rawBody, hmacHeader) {
   const secret = process.env.SHOPIFY_WEBHOOK_SECRET;
   if (!secret) throw new Error("Missing SHOPIFY_WEBHOOK_SECRET");
-
-  const digest = crypto.createHmac("sha256", secret).update(rawBody).digest("base64");
-
-  // If header missing, fail safely
   if (!hmacHeader) return false;
 
+  const digest = crypto.createHmac("sha256", secret).update(rawBody).digest("base64");
   return crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(hmacHeader));
 }
 
+function getShopifyDomain() {
+  return (
+    process.env.SHOPIFY_STORE_DOMAIN ||
+    process.env.SHOPIFY_SHOP_DOMAIN ||
+    process.env.SHOPIFY_SHOP ||
+    process.env.SHOP_DOMAIN ||
+    ""
+  ).replace(/^https?:\/\//, "").trim();
+}
+
+function getShopifyAdminToken() {
+  return (
+    process.env.SHOPIFY_ADMIN_ACCESS_TOKEN || // ✅ your current var
+    process.env.SHOPIFY_ADMIN_TOKEN ||
+    process.env.SHOPIFY_ACCESS_TOKEN ||
+    process.env.SHOPIFY_ADMIN_API_TOKEN ||
+    ""
+  ).trim();
+}
+
+function getShopifyApiVersion() {
+  return (process.env.SHOPIFY_ADMIN_API_VERSION || "2024-07").trim();
+}
+
 async function shopifyGraphQL(query, variables) {
-  const domain = process.env.SHOPIFY_STORE_DOMAIN; // ✅ your existing var
-  const token = process.env.SHOPIFY_ADMIN_ACCESS_TOKEN; // ✅ your existing var
-  const apiVersion = process.env.SHOPIFY_ADMIN_API_VERSION || "2024-07"; // ✅ your existing var (or fallback)
+  const domain = getShopifyDomain();
+  const token = getShopifyAdminToken();
+  const apiVersion = getShopifyApiVersion();
 
   if (!domain || !token) {
-    throw new Error(`Missing Shopify Admin credentials. domain=${!!domain} token=${!!token}`);
+    throw new Error(
+      `Missing Shopify Admin credentials. domain=${!!domain} token=${!!token}`
+    );
   }
 
   const resp = await fetch(`https://${domain}/admin/api/${apiVersion}/graphql.json`, {
@@ -75,8 +98,8 @@ async function getOrder(orderGid) {
 }
 
 /**
- * TODO: Replace this with your REAL eSIM Go lookup.
- * For now it's a placeholder so the webhook/email pipeline can be proven.
+ * Placeholder until wired to eSIM Go for real.
+ * Replace this function when ready.
  */
 async function getEsimDetailsForOrder(order) {
   const firstItem = order?.lineItems?.edges?.[0]?.node;
@@ -101,9 +124,7 @@ export default async function handler(req, res) {
 
     const payload = JSON.parse(rawBody.toString("utf8"));
 
-    // REST webhook payload.id is numeric; GraphQL needs a gid
     const orderGid = `gid://shopify/Order/${payload.id}`;
-
     const order = await getOrder(orderGid);
 
     const esim = await getEsimDetailsForOrder(order);
@@ -112,7 +133,6 @@ export default async function handler(req, res) {
       .filter(Boolean)
       .join(" ");
 
-    // Send email (backup channel)
     await sendEsimEmail({
       to: order.email,
       subject: `Your eSIM is ready – ${order.name}`,
