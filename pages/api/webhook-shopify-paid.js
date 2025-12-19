@@ -20,26 +20,22 @@ function verifyShopifyWebhook(rawBody, hmacHeader) {
   return crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(hmacHeader));
 }
 
-function esimGoBaseUrl() {
-  // eSIM Go docs use https://api.esim-go.com/v2.4 (or newer). :contentReference[oaicite:3]{index=3}
-  return "https://api.esim-go.com/v2.4";
-}
+// --- eSIM Go helpers (adjust endpoint if your account uses a different base) ---
+const ESIMGO_BASE_URL = "https://api.esim-go.com/v2.4";
 
 function esimGoHeaders() {
   const key = process.env.ESIMGO_API_KEY;
   if (!key) throw new Error("Missing ESIMGO_API_KEY");
   return {
     "Content-Type": "application/json",
-    "X-API-Key": key, // eSIM Go auth header :contentReference[oaicite:4]{index=4}
+    "X-API-Key": key,
+    Accept: "application/json",
   };
 }
 
-/**
- * Step 1: Create an order (buy + assign bundle to a new eSIM)
- * Uses /orders as per eSIM Go ordering guide. :contentReference[oaicite:5]{index=5}
- */
 async function esimGoCreateOrder({ item, quantity }) {
-  const url = `${esimGoBaseUrl()}/orders?includeIccids=true`;
+  const url = `${ESIMGO_BASE_URL}/orders?includeIccids=true`;
+
   const body = {
     type: "transaction",
     assign: true,
@@ -47,8 +43,7 @@ async function esimGoCreateOrder({ item, quantity }) {
       {
         type: "bundle",
         quantity: quantity || 1,
-        item, // bundle name (case sensitive) :contentReference[oaicite:6]{index=6}
-        // No ICCIDs provided => auto-assign to new eSIM(s) :contentReference[oaicite:7]{index=7}
+        item,
       },
     ],
   };
@@ -64,21 +59,12 @@ async function esimGoCreateOrder({ item, quantity }) {
   return json;
 }
 
-/**
- * Step 2: Get install details from order reference
- * /esims/assignments returns ICCID + SMDP+ + MatchingID. :contentReference[oaicite:8]{index=8}
- */
 async function esimGoGetAssignments(orderReference) {
-  const url = `${esimGoBaseUrl()}/esims/assignments?reference=${encodeURIComponent(
-    orderReference
-  )}`;
+  const url = `${ESIMGO_BASE_URL}/esims/assignments?reference=${encodeURIComponent(orderReference)}`;
 
   const resp = await fetch(url, {
     method: "GET",
-    headers: {
-      ...esimGoHeaders(),
-      Accept: "application/json",
-    },
+    headers: esimGoHeaders(),
   });
 
   const json = await resp.json();
@@ -86,18 +72,16 @@ async function esimGoGetAssignments(orderReference) {
   return json;
 }
 
-function buildAppleUniversalLink(lpaString) {
-  // Apple universal link format for eSIM install (iOS 17.4+) :contentReference[oaicite:9]{index=9}
-  return `https://esimsetup.apple.com/esim_qrcode_provisioning?carddata=${encodeURIComponent(
-    lpaString
-  )}`;
+function buildLpaString(smdpAddress, matchingId) {
+  return `LPA:1$${smdpAddress}$${matchingId}`;
+}
+
+function buildAppleInstallLink(lpaString) {
+  return `https://esimsetup.apple.com/esim_qrcode_provisioning?carddata=${encodeURIComponent(lpaString)}`;
 }
 
 function buildQrImageUrl(lpaString) {
-  // QR image hosted externally (no file storage needed)
-  return `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(
-    lpaString
-  )}`;
+  return `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(lpaString)}`;
 }
 
 export default async function handler(req, res) {
@@ -112,12 +96,76 @@ export default async function handler(req, res) {
 
     const payload = JSON.parse(rawBody.toString("utf8"));
 
-    // Use webhook payload (no Shopify Admin API)
-    const orderName = payload?.name || `Order ${payload?.id || ""}`;
-    const toEmail = payload?.email;
-    const customerName =
-      [payload?.customer?.first_name, payload?.customer?.last_name].filter(Boolean).join(" ") ||
-      "there";
+    // --- Pull what we need directly from the webhook payload (no Admin API) ---
+    const orderName = payload && payload.name ? payload.name : `Order ${payload && payload.id ? payload.id : ""}`;
+    const toEmail = payload && payload.email ? payload.email : null;
 
-    const firstItem = payload?.line_items?.[0];
-    if (!firstItem) throw new Error("No line
+    const firstName = payload && payload.customer ? payload.customer.first_name : "";
+    const lastName = payload && payload.customer ? payload.customer.last_name : "";
+    const customerName = `${firstName || ""} ${lastName || ""}`.trim() || "there";
+
+    const firstItem = payload && payload.line_items && payload.line_items.length ? payload.line_items[0] : null;
+    if (!firstItem) throw new Error("No line items on order payload");
+
+    const productTitle = firstItem.title || "eSIM";
+    const quantity = firstItem.quantity || 1;
+
+    // We use SKU as the eSIM Go bundle name (your setup)
+    const bundleName = firstItem.sku;
+    if (!toEmail) throw new Error("Order payload missing customer email");
+    if (!bundleName) throw new Error("Line item missing SKU (used as eSIM Go bundle name)");
+
+    // --- eSIM Go provision ---
+    const orderResp = await esimGoCreateOrder({ item: bundleName, quantity });
+
+    const orderReference =
+      orderResp.orderReference ||
+      orderResp.reference ||
+      orderResp.order_reference;
+
+    if (!orderReference) {
+      throw new Error(`eSIM Go response missing orderReference: ${JSON.stringify(orderResp)}`);
+    }
+
+    const assignResp = await esimGoGetAssignments(orderReference);
+
+    const first =
+      (assignResp.assignments && assignResp.assignments[0]) ||
+      (assignResp.data && assignResp.data[0]) ||
+      (Array.isArray(assignResp) ? assignResp[0] : null);
+
+    if (!first) throw new Error(`No assignments returned: ${JSON.stringify(assignResp)}`);
+
+    const iccid = first.iccid || first.ICCID;
+    const smdpAddress = first.smdpAddress || first.smdp_address || first.smdp;
+    const matchingId = first.matchingId || first.matching_id || first.matching;
+
+    if (!iccid || !smdpAddress || !matchingId) {
+      throw new Error(`Missing install fields from assignments: ${JSON.stringify(assignResp)}`);
+    }
+
+    const lpaString = buildLpaString(smdpAddress, matchingId);
+    const iosInstallUrl = buildAppleInstallLink(lpaString);
+    const qrCodeUrl = buildQrImageUrl(lpaString);
+
+    await sendEsimEmail({
+      to: toEmail,
+      subject: `Your eSIM is ready – ${orderName}`,
+      payload: {
+        customerName,
+        productTitle,
+        iccid,
+        qrCodeUrl,
+        iosInstallUrl,
+        smdpAddress,
+        matchingId,
+        lpaString,
+      },
+    });
+
+    return res.status(200).json({ ok: true, orderReference, iccid });
+  } catch (err) {
+    console.error("Webhook error:", err);
+    return res.status(500).json({ ok: false, error: err.message || "Server error" });
+  }
+}
