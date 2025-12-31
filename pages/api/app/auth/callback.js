@@ -1,4 +1,10 @@
-import { exchangeToken, getCookie, seal, setCookie, unseal } from "../../../lib/customer-account";
+import {
+  exchangeToken,
+  getCookie,
+  seal,
+  setCookie,
+  unseal,
+} from "../../../lib/customer-account.js";
 
 export default async function handler(req, res) {
   try {
@@ -18,7 +24,7 @@ export default async function handler(req, res) {
       redirectUri: auth.redirectUri,
     });
 
-    // Store access token in encrypted cookie (MVP). Later: move to DB + refresh rotation.
+    // Store access token in encrypted cookie (MVP)
     setCookie(res, "ca_sess", seal({ accessToken: token.access_token, scope: token.scope, ts: Date.now() }), {
       httpOnly: true,
       secure: true,
@@ -26,7 +32,7 @@ export default async function handler(req, res) {
       maxAge: Math.max(300, token.expires_in || 3600),
     });
 
-    // send user back to app – you can replace this with a deep link later
+    // In production you’ll deep-link back into Rork. For now: home.
     return res.redirect(302, "/");
   } catch (e) {
     return res.status(500).send(`Auth callback error: ${e.message || "error"}`);
