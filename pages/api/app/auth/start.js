@@ -1,4 +1,11 @@
-import { getDiscovery, makeNonce, makePkce, makeState, seal, setCookie } from "../../../lib/customer-account";
+import {
+  getDiscovery,
+  makeNonce,
+  makePkce,
+  makeState,
+  seal,
+  setCookie,
+} from "../../../lib/customer-account.js";
 
 export default async function handler(req, res) {
   try {
@@ -15,7 +22,7 @@ export default async function handler(req, res) {
     const nonce = makeNonce();
     const pkce = makePkce();
 
-    // store verifier/state/nonce in encrypted cookie
+    // Store state/verifier in an encrypted cookie (10 minutes)
     setCookie(res, "ca_auth", seal({ state, nonce, verifier: pkce.verifier, redirectUri }), {
       httpOnly: true,
       secure: true,
@@ -24,6 +31,8 @@ export default async function handler(req, res) {
     });
 
     const url = new URL(openid.authorization_endpoint);
+
+    // Scope for Customer Account API access
     url.searchParams.set("scope", "openid email customer-account-api:full");
     url.searchParams.set("client_id", clientId);
     url.searchParams.set("response_type", "code");
